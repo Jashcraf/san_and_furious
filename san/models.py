@@ -111,6 +111,7 @@ class CoronagraphModel:
         self.aperture = Field(
             np.exp(-(self.pupil_grid.as_('polar').r / (0.5 * pupil_diameter)) ** 30),
             self.pupil_grid)
+        self.lyot_stop = circular_aperture(0.9 * self.pupil_diameter)(self.pupil_grid)
 
         # ---- dark zone -----------------------------------------------------
         dark_zone = circular_aperture(2 * owa)(self.focal_grid)
@@ -120,7 +121,8 @@ class CoronagraphModel:
         self.dz_mask = self.dark_zone.shaped == 1   # 2D boolean mask
 
         # ---- optical elements ---------------------------------------------
-        self.coronagraph = PerfectCoronagraph(self.aperture, order=coronagraph_order)
+        #self.coronagraph = PerfectCoronagraph(self.aperture, order=coronagraph_order)
+        self.coronagraph = VortexCoronagraph(self.pupil_grid, coronagraph_order, lyot_stop=self.lyot_stop)
 
         # tip-tilt is assumed handled elsewhere (e.g. QACITS), so remove it
         tip_tilt = make_zernike_basis(3, pupil_diameter, self.pupil_grid, starting_mode=2)
@@ -247,7 +249,7 @@ class CoronagraphModel:
         self.disturbance_dm.actuators = actuator_commands
 
     # -- the forward model ----------------------------------------------------
-    def wavefront(self, actuators=None, include_aberration=True):
+    def forward(self, actuators=None, include_aberration=True):
         """Propagate to the focal plane and return the post-coronagraph wavefront.
 
         Parameters
@@ -288,7 +290,7 @@ class CoronagraphModel:
         ndarray
             Shaped intensity image, normalized by the reference PSF peak.
         """
-        return self.wavefront(actuators, include_aberration).intensity.shaped / self.img_ref.max()
+        return self.forward(actuators, include_aberration).intensity.shaped / self.img_ref.max()
 
     def darkzone_contrast(self, actuators=None):
         """Mean normalized intensity inside the dark zone."""

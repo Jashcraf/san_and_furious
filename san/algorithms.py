@@ -22,7 +22,7 @@ Available algorithms
 """
 
 import numpy as np
-
+import ipdb
 
 class SpeckleNuller:
     """Base class holding the DM state and the shared phase-shifting machinery.
@@ -64,6 +64,8 @@ class SpeckleNuller:
 
         # current DM state
         self.actuators = np.zeros(model.num_actuators)              # actuator commands
+
+        # self.w is complex, where the real part is the cosine coefficient, and the imag is the sine
         self.w = np.zeros(self.n_modes, dtype=complex)              # modal command (a_probe units)
         self.kappa2 = None                                          # per-pixel |k'|^2
 
@@ -118,24 +120,44 @@ class SpeckleNuller:
         sin_probe = self.model.sin_probe
 
         I0 = self.last_image                                 # reuse current-state image (free)
-        Icp = self._image(a + cos_probe); Icm = self._image(a - cos_probe)
-        Isp = self._image(a + sin_probe); Ism = self._image(a - sin_probe)
+        Icp = self._image(a + cos_probe)
+        Icm = self._image(a - cos_probe)
+        Isp = self._image(a + sin_probe)
+        Ism = self._image(a - sin_probe)
 
+        # Grabs current command state
         w0 = self.w
-        self._record(w0,       I0)
+
+        # Returns phase-shifted coefficients with images
+        # self._record(w0,       I0)
         self._record(w0 + 1,   Icp)
         self._record(w0 - 1,   Icm)
         self._record(w0 + 1j,  Isp)
         self._record(w0 - 1j,  Ism)
 
+        # Gets dark zone boolean
         dz = self.dz
         mod_cos = (Icp[dz] + Icm[dz] - 2 * I0[dz]) / 2.0     # = |k'|^2 (cos quadrature)
-        mod_sin = (Isp[dz] + Ism[dz] - 2 * I0[dz]) / 2.0
+        mod_sin = (Isp[dz] + Ism[dz] - 2 * I0[dz]) / 2.0     # = |k'|^2 (sin quadrature)
+        
+        # store quadrature-specific kappa
+        self.kappa_cos = mod_cos
+        self.kappa_sin = mod_sin
+        
+        # Doesn't let response go below epsilon
         self.kappa2 = np.maximum(0.5 * (mod_cos + mod_sin), self.eps_floor)
 
         san_cos = (Icp[dz] - Icm[dz]) / (2 * mod_cos)
         san_sin = (Isp[dz] - Ism[dz]) / (2 * mod_sin)
-        self._apply(-0.5 * gain * (san_cos + 1j * san_sin))
+
+        # -0.5 for converting OPD to mirror surface
+        correction = -0.5 * gain * (san_cos + 1j * san_sin)
+        command = self._command(correction)
+        I_cor = self._image(a + command)
+        self._record(w0 + correction, I_cor)
+
+        # Actually apply the correction
+        self._apply(correction)
 
     def furious_step(self, gain=None):
         """Per-pixel least-squares phase-shifting over the recorded history, with
@@ -146,31 +168,39 @@ class SpeckleNuller:
         ``E0 k'^* = (a1 + i a2)/2`` and the nulling command is
         ``w_target = -(a1 + i a2) / (2 |k'|^2)``."""
         gain = self._resolve_gain(gain)
-        # reuse the current-state image as a fresh frame (no new exposure), then solve.
-        self._record(self.w, self.last_image)
+        acts = self.actuators
+        w0 = self.w
 
+        # reuse the current-state image as a fresh frame (no new exposure), then solve.
         W = np.asarray(self.prior_corrections)               # (Nframes, Npix) complex
         I = np.asarray(self.prior_images)                    # (Nframes, Npix)
         nframes, npix = W.shape
         wt = (self.forget ** np.arange(nframes)[::-1])[:, None]   # newest frame -> weight 1
-
         c = W.real
         s = W.imag
+
+        # Subtract probe energy from prior images
         y = I - self.kappa2[None, :] * np.abs(W) ** 2
 
         M = np.empty((npix, 3, 3))
-        M[:, 0, 0] = wt.sum()
-        M[:, 0, 1] = M[:, 1, 0] = (wt * c).sum(0)
-        M[:, 0, 2] = M[:, 2, 0] = (wt * s).sum(0)
-        M[:, 1, 1] = (wt * c * c).sum(0)
-        M[:, 1, 2] = M[:, 2, 1] = (wt * c * s).sum(0)
-        M[:, 2, 2] = (wt * s * s).sum(0)
-        b = np.stack([(wt * y).sum(0), (wt * y * c).sum(0), (wt * y * s).sum(0)], axis=-1)
+        M[:, 0, 0] = wt.sum() # Equal to Nframes when self.forget=1
+        M[:, 0, 1] = M[:, 1, 0] = (wt * c).sum(axis=0)
+        M[:, 0, 2] = M[:, 2, 0] = (wt * s).sum(axis=0)
+        M[:, 1, 1] = (wt * c * c).sum(axis=0)
+        M[:, 1, 2] = M[:, 2, 1] = (wt * c * s).sum(axis=0)
+        M[:, 2, 2] = (wt * s * s).sum(axis=0)
+        b = np.stack([(wt * y).sum(axis=0),
+                      (wt * y * c).sum(axis=0),
+                      (wt * y * s).sum(axis=0)], axis=-1)
 
         a = np.linalg.solve(M, b)                            # (Npix, 3): a0, a1, a2
-        Z = 0.5 * (a[:, 1] + 1j * a[:, 2])                   # = E0 * conj(k')
-        w_target = -Z / self.kappa2                          # nulling command (a_probe units)
-        self._apply(gain * (w_target - self.w))
+        Z = -0.5 * (a[:, 1] + 1j * a[:, 2])                   # = E0 * conj(k')
+        correction = Z / self.kappa2                          # nulling command (a_probe units)
+        self._apply(gain * (correction - w0))
+        
+        command = self._command(correction)
+        I_cor = self._image(acts + command)
+        self._record(correction, I_cor)
 
     def _solve_residual_differential(self):
         """Per-pixel weighted 2x2 least squares for the residual ``Z = R_now k'^*`` from
@@ -240,26 +270,24 @@ class SANAndFurious(SpeckleNuller):
     phase-diverse commands its static speckle field is estimated by least squares
     (:meth:`furious_step`).
 
+    Occasionally this will stall, which means that prior history is overwritten
+    and the nuller must be re-seeded with a SAN step
+
     Parameters
     ----------
-    probe_every_n : int
-        How often :meth:`step` spends a 5-frame SAN burst to inject fresh near-state
-        phase diversity and recalibrate ``|k'|^2``.  ``1`` probes every iteration
-        (deepest, most exposures); ``n>1`` reuses the command history (furious-only) in
-        between, trading depth-per-iteration for far fewer exposures.
     forget : float in (0, 1]
         Forgetting factor (see :class:`SpeckleNuller`).  Defaults to ``0.5``.
     """
 
-    def __init__(self, model, gain=1.0, forget=0.5, probe_every_n=1):
+    def __init__(self, model, gain=1.0, forget=0.5):
         super().__init__(model, gain=gain, forget=forget)
-        self.probe_every_n = probe_every_n
 
     def step(self, gain=None):
         gain = self._resolve_gain(gain)
-        if self.kappa2 is None or self._iter % self.probe_every_n == 0:
+        if self.kappa2 is None:
             self.san_step(gain)
-        self.furious_step(gain)
+        else:
+            self.furious_step(gain)
         self._iter += 1
 
 
