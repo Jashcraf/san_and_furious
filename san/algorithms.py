@@ -15,20 +15,20 @@ algorithm only overrides :meth:`step`, which performs one iteration:
 Available algorithms
 --------------------
 - :class:`SpeckleAreaNulling`     -- classic 5-frame symmetric-difference SAN.
-- :class:`SANAndFurious`          -- SAN seed + per-pixel least-squares history reuse.
 - :class:`MinStepNulling`         -- non-SAN 3-frame (2 fresh exposures) downward step.
-- :class:`FastAndFurious`         -- one fresh probe + forgetting-weighted history.
+- :class:`LagAndFurious`          -- one fresh probe + forgetting-weighted history.
 - :class:`FastAndFuriousNoProbe`  -- correction-history-only step (no fresh probe).
 """
 
 import numpy as np
 import ipdb
+from .san_math import mat_inv_2x2, mat_inv_3x3
 
 class SpeckleNuller:
     """Base class holding the DM state and the shared phase-shifting machinery.
 
     Concrete algorithms override :meth:`step`.  The reusable primitives
-    :meth:`san_step`, :meth:`furious_step` and :meth:`_solve_residual_differential`
+    :meth:`san_step`, :meth:`psi_step` and :meth:`_solve_residual_differential`
     live here so the algorithms can compose them.
 
     Notes on the model
@@ -63,20 +63,22 @@ class SpeckleNuller:
         self.n_modes = model.num_frequencies                        # 1:1 with dark-zone pixels
 
         # current DM state
-        self.actuators = np.zeros(model.num_actuators)              # actuator commands
+        self.actuators = np.zeros(model.num_actuators)              # current actuator commands
 
         # self.w is complex, where the real part is the cosine coefficient, and the imag is the sine
-        self.w = np.zeros(self.n_modes, dtype=complex)              # modal command (a_probe units)
+        self.coefficients = np.zeros(self.n_modes, dtype=complex)   # current complex modal command (a_probe units)
         self.kappa2 = None                                          # per-pixel |k'|^2
 
         # phase-shifting "frames" reused for the least-squares inversions
         self.prior_corrections = []   # complex modal command per frame (a_probe units)
         self.prior_images = []        # measured dark-zone intensity per frame
+        self.prior_kappa2 = []
+        self.prior_field_est = []
         self.n_exposures = 0          # total forward-model evaluations (efficiency metric)
         self._iter = 0                # step counter
         self.last_image = self._image(self.actuators)   # always the current-state image
 
-    # -- convenience ----------------------------------------------------------
+    # convenience methods
     @property
     def contrast(self):
         """Current dark-zone mean contrast."""
@@ -85,27 +87,31 @@ class SpeckleNuller:
     def _resolve_gain(self, gain):
         return self.gain if gain is None else gain
 
-    # -- exposure / state helpers --------------------------------------------
+    # exposure / state helpers 
     def _image(self, actuators):
         """Take one exposure (forward-model evaluation) and tally it."""
         self.n_exposures += 1
         return self.model.image(actuators)
 
-    def _command(self, w_modal):
+    # was _command
+    def _coefficients_to_command(self, coefficients):
         """DM actuator vector for a complex modal command (a_probe units)."""
-        return self.model.command(w_modal)
+        return self.model.command(coefficients)
 
-    def _record(self, w_modal, image_full):
+    def _record(self, coefficients, image_full):
         """Append one phase-shifting frame: the applied command and the image it made."""
-        self.prior_corrections.append(np.asarray(w_modal, dtype=complex).copy())
+        self.prior_corrections.append(np.asarray(coefficients, dtype=complex).copy())
         self.prior_images.append(image_full[self.dz].copy())
 
-    def _apply(self, dw):
+    def _add_command(self, dw):
         """Add an incremental modal command ``dw`` (a_probe units) to the DM state, and
         refresh the current-state image so it can be reused as the next frame without
         re-exposing."""
-        self.actuators = self.actuators + self._command(dw)
-        self.w = self.w + dw
+        # Updates actuator state
+        self.actuators = self.actuators + self._coefficients_to_command(dw)
+        
+        # Updates coefficient state
+        self.coefficients += dw
         self.last_image = self._image(self.actuators)
 
     # -- reusable algorithmic primitives -------------------------------------
@@ -114,119 +120,342 @@ class SpeckleNuller:
         frames, (re)calibrates the per-pixel gain ``|k'|^2``, and applies the SAN
         correction.  With ``w`` in ``a_probe`` units, the +/-cos probe is ``w0 +/- 1``
         and the +/-sin probe is ``w0 +/- 1j``."""
-        gain = self._resolve_gain(gain)
+
+        # Store current instrument state (after all prior corrections) 
         a = self.actuators
+        w0 = self.coefficients
+
+        # Get correction complex coefficients
+        correction = self._solve_san_coefficients(gain)
+        
+        # Convert to DM commands
+        command = self._coefficients_to_command(correction)
+        
+        # Get an updated image
+        I_cor = self._image(a + command)
+
+        # Append correction to history with "probed" intensity
+        # Because we add to w0, this stores the total phase shift
+        # applied to the N-1 correction
+        self._record(w0 + correction, I_cor)
+
+        # Update N-1 state to N - updates last image
+        self._add_command(correction)
+
+    def psi_step(self, gain=None):
+        
+        # Store reference values
+        a = self.actuators
+        w0 = self.coefficients
+        
+        # Get correction complex coefficients
+        # correction = self._solve_psi_coefficients(gain)
+        correction = self._solve_residual_differential(gain)
+        
+        # Convert to DM commands
+        command = self._coefficients_to_command(correction)
+        
+        # Get an updated image
+        I_cor = self._image(a + command)
+
+        # Append correction to history with "probed" intensity
+        # Because we add to w0, this stores the total phase shift
+        # applied to the original correction
+        self._record(w0 + correction, I_cor)
+
+        # Actually apply the correction - updates last image
+        self._add_command(correction)
+
+    def furious_step(self, gain=None):
+        # Store reference values
+        a = self.actuators
+        w0 = self.coefficients
+        
+        # Get correction complex coefficients
+        # correction = self._solve_psi_coefficients(gain)
+        correction = self._solve_furious_coefficients(gain)
+        
+        # Convert to DM commands
+        command = self._coefficients_to_command(correction)
+        
+        # Get an updated image
+        I_cor = self._image(a + command)
+
+        # Append correction to history with "probed" intensity
+        # Because we add to w0, this stores the total phase shift
+        # applied to the original correction
+        self._record(w0 + correction, I_cor)
+
+        # Actually apply the correction - updates last image
+        self._add_command(correction)
+
+
+    def _solve_san_coefficients(self, gain):
+        """Solve for the complex coefficients that correct a DH
+        using the Speckle Area Nulling method by Oya et al. 2017
+
+        Parameters
+        ----------
+        gain : float or NoneType
+            gain to apply to correction estimation, if None,
+            defaults to 1 via self._resolve_gain(gain)
+
+        Returns
+        -------
+        complex ndarray
+           array of coefficients corresponding to each fourier mode, 
+           where the real part is the cosine and the imag part is the sine 
+        """
+        
+        gain = self._resolve_gain(gain)
         cos_probe = self.model.cos_probe
         sin_probe = self.model.sin_probe
+        
+        # Grabs current command state
+        w0 = self.coefficients
+        a = self.actuators
 
+        # Returns phase-shifted coefficients with images 
         I0 = self.last_image                                 # reuse current-state image (free)
         Icp = self._image(a + cos_probe)
         Icm = self._image(a - cos_probe)
         Isp = self._image(a + sin_probe)
         Ism = self._image(a - sin_probe)
 
-        # Grabs current command state
-        w0 = self.w
-
-        # Returns phase-shifted coefficients with images
-        # self._record(w0,       I0)
-        self._record(w0 + 1,   Icp)
-        self._record(w0 - 1,   Icm)
-        self._record(w0 + 1j,  Isp)
-        self._record(w0 - 1j,  Ism)
+        # Records applied phase shifts
+        # self._record(w0, I0) 
+        # self._record(w0 + 1,   Icp)
+        # self._record(w0 - 1,   Icm)
+        # self._record(w0 + 1j,  Isp)
+        # self._record(w0 - 1j,  Ism)
 
         # Gets dark zone boolean
         dz = self.dz
         mod_cos = (Icp[dz] + Icm[dz] - 2 * I0[dz]) / 2.0     # = |k'|^2 (cos quadrature)
         mod_sin = (Isp[dz] + Ism[dz] - 2 * I0[dz]) / 2.0     # = |k'|^2 (sin quadrature)
         
-        # store quadrature-specific kappa
+        # store quadrature-specific kappa for logging
         self.kappa_cos = mod_cos
         self.kappa_sin = mod_sin
         
-        # Doesn't let response go below epsilon
+        # Doesn't let response go below epsilon, otherwise averages
         self.kappa2 = np.maximum(0.5 * (mod_cos + mod_sin), self.eps_floor)
+        self.prior_kappa2.append(self.kappa2)
 
+        # Actual SAN coefficients
         san_cos = (Icp[dz] - Icm[dz]) / (2 * mod_cos)
         san_sin = (Isp[dz] - Ism[dz]) / (2 * mod_sin)
+        field_est = san_cos + 1j * san_sin
+
+        # Record the field estimation
+        self.prior_field_est.append(field_est)
 
         # -0.5 for converting OPD to mirror surface
-        correction = -0.5 * gain * (san_cos + 1j * san_sin)
-        command = self._command(correction)
-        I_cor = self._image(a + command)
-        self._record(w0 + correction, I_cor)
+        return -0.5 * gain * field_est 
 
-        # Actually apply the correction
-        self._apply(correction)
+    def _solve_psi_coefficients(self, gain):
+        """Solves Grievenkamp 1984 least-squares PSI matrix
+        to get phase of speckle correction. Requires history
+        of phase shifted speckles.
 
-    def furious_step(self, gain=None):
-        """Per-pixel least-squares phase-shifting over the recorded history, with
-        exponential forgetting so stale frames don't bias the static-linear fit.
+        Parameters
+        ----------
+        gain : float or NoneType
+            gain to apply to correction estimation, if None,
+            defaults to 1 via self._resolve_gain(gain)
 
-        Moving the known ``|k'|^2 |w_n|^2`` to the left (``y_n = I_n - |k'|^2 |w_n|^2``)
-        gives the standard phase-shifting normal equations, solved per pixel; then
-        ``E0 k'^* = (a1 + i a2)/2`` and the nulling command is
-        ``w_target = -(a1 + i a2) / (2 |k'|^2)``."""
+        Returns
+        -------
+        complex ndarray
+           array of coefficients corresponding to each fourier mode, 
+           where the real part is the cosine and the imag part is the sine 
+        """
+        
         gain = self._resolve_gain(gain)
-        acts = self.actuators
-        w0 = self.w
+        cos_probe = self.model.cos_probe
+        sin_probe = self.model.sin_probe
+        
+        # Grabs current command state
+        w0 = self.coefficients
+        a = self.actuators
 
         # reuse the current-state image as a fresh frame (no new exposure), then solve.
         W = np.asarray(self.prior_corrections)               # (Nframes, Npix) complex
-        I = np.asarray(self.prior_images)                    # (Nframes, Npix)
+        I = np.asarray(self.prior_images)                    # (Nframes, Npix) real
         nframes, npix = W.shape
-        wt = (self.forget ** np.arange(nframes)[::-1])[:, None]   # newest frame -> weight 1
+
+        # Unpack cosine (c) and sine (s) coefficients
         c = W.real
         s = W.imag
-
-        # Subtract probe energy from prior images
+        
+        # Subtract probe energy from prior images - requires kappa2, which is computed by SAN
         y = I - self.kappa2[None, :] * np.abs(W) ** 2
 
+        # pre-define matrix
         M = np.empty((npix, 3, 3))
-        M[:, 0, 0] = wt.sum() # Equal to Nframes when self.forget=1
-        M[:, 0, 1] = M[:, 1, 0] = (wt * c).sum(axis=0)
-        M[:, 0, 2] = M[:, 2, 0] = (wt * s).sum(axis=0)
-        M[:, 1, 1] = (wt * c * c).sum(axis=0)
-        M[:, 1, 2] = M[:, 2, 1] = (wt * c * s).sum(axis=0)
-        M[:, 2, 2] = (wt * s * s).sum(axis=0)
-        b = np.stack([(wt * y).sum(axis=0),
-                      (wt * y * c).sum(axis=0),
-                      (wt * y * s).sum(axis=0)], axis=-1)
+        M[:, 0, 0] = nframes 
+        M[:, 0, 1] = M[:, 1, 0] = c.sum(axis=0)
+        M[:, 0, 2] = M[:, 2, 0] = s.sum(axis=0)
+        M[:, 1, 1] = (c * c).sum(axis=0)
+        M[:, 1, 2] = M[:, 2, 1] = (c * s).sum(axis=0)
+        M[:, 2, 2] = (s * s).sum(axis=0)
+        b = np.stack([y.sum(axis=0),
+                      (y * c).sum(axis=0),
+                      (y * s).sum(axis=0)], axis=-1)
 
-        a = np.linalg.solve(M, b)                            # (Npix, 3): a0, a1, a2
-        Z = -0.5 * (a[:, 1] + 1j * a[:, 2])                   # = E0 * conj(k')
-        correction = Z / self.kappa2                          # nulling command (a_probe units)
-        self._apply(gain * (correction - w0))
-        
-        command = self._command(correction)
-        I_cor = self._image(acts + command)
-        self._record(correction, I_cor)
+        # tiny Tikhonov ridge so pixels that have only seen one quadrature don't blow up
+        ridge = 1e-6 * (M[:, 0, 0] + M[:, 1, 1] + M[:, 2, 2]) + 1e-30
+        M[:, 0, 0] += ridge
+        M[:, 1, 1] += ridge
+        M[:, 2, 2] += ridge
 
-    def _solve_residual_differential(self):
-        """Per-pixel weighted 2x2 least squares for the residual ``Z = R_now k'^*`` from
-        the differential model over the forgetting-weighted history.  For each recorded
-        frame k (command ``w_k``, image ``I_k``), with ``delta_k = w_now - w_k``::
+        # Solve the matrix inversion with analytic inverse
+        Minv = mat_inv_3x3(M)
+        a = Minv @ b[..., None] # append axis for matrix mult
+        a = a[..., 0]           # take it away
+
+        # get the correction
+        a0, a1, a2 = a[..., 0], a[..., 1], a[..., 2]
+
+        # a1 = 2 Re(E0* k'), a2 = -2 Im(E0* k'); the ABSOLUTE nulling command is
+        # w_target = -(a1 + i a2) / (2 |k'|^2).  Unlike _solve_san_coefficients (which
+        # probes around the current state and so returns a step), this static fit yields
+        # the absolute target, so return the INCREMENT from w0 -- otherwise psi_step
+        # lands at w0 + w_target and the command explodes once w0 != 0.
+        w_target = -0.5 * (a1 + 1j * a2) / self.kappa2
+        return gain * (w_target - w0)
+
+    def _solve_furious_coefficients(self, gain):
+        """Estimate the current residual field from the two most recent corrections
+        and return the modal command that nulls it.
+
+        Direct port of ``solve_prev_field`` + propagation in ``iterative_san.py``.
+        Work in modal-residual units ``G = R / k'`` (so ``I = |k'|^2 |G|^2`` and the
+        command that nulls a residual ``G`` is ``dw = -gain * G``).  The SAN-convention
+        field estimate stored in ``prior_field_est`` is ``F = 2 G`` (see
+        :meth:`_solve_san_coefficients`), so ``Ghat = F / 2``.
+
+        With ``g`` the loop gain and the three most recent *distinct* frames
+        ``i-2, i-1, i`` -- the current state is the newest recorded frame
+        ``prior_images[-1]`` (``last_image`` is the SAME state, so it is NOT a separate
+        frame), and ``F[-1]``/``F[-2]`` are the estimates whose ``-g Ghat`` corrections
+        produced frames ``i`` and ``i-1`` --::
+
+            P_newest = (I_{i-1} - I_i   + g^2 |k'|^2 |Ghat_{i-1}|^2) / (2 g)   [= |k'|^2 Re(Ghat_{i-1}^* G_{i-1})]
+            P_slid   = (I_{i-2} - I_{i-1} - g^2 |k'|^2 |Ghat_{i-2}|^2) / (2 g) [= |k'|^2 Re(Ghat_{i-2}^* G_{i-1})]
+
+        A 2x2 solve over the two prior estimate directions gives the residual
+        ``G_{i-1}``; propagating the one applied correction forward yields the current
+        residual estimate ``Ghat_i = G_{i-1} - g Ghat_{i-1}``, nulled by ``dw = -g Ghat_i``.
+
+        Parameters
+        ----------
+        gain : float or NoneType
+            loop gain; defaults to 1 via :meth:`_resolve_gain`.
+
+        Returns
+        -------
+        complex ndarray
+            modal command increment (a_probe units) per Fourier mode.
+        """
+        gain = self._resolve_gain(gain)
+
+        I = np.asarray(self.prior_images)                    # (Nframes, Npix) real
+        F = np.asarray(self.prior_field_est)                 # (Nframes, Npix) complex (= 2 * Ghat)
+        nframes, npix = I.shape
+        # assert nframes >= 3 and F.shape[0] >= 2, \
+        #     "furious_step needs >= 3 recorded frames; seed with >= 3 san_step calls"
+
+        kappa2 = self.kappa2                                  # (Npix,) = |k'|^2
+
+        # field estimates whose -g*Ghat corrections produced the two most recent frames
+        # (modal-residual units); F stores the SAN convention 2 * Ghat.
+        Ghat_im1 = 0.5 * F[-1]                               # Ghat_{i-1}  (made I_i)
+        Ghat_im2 = 0.5 * F[-2]                               # Ghat_{i-2}  (made I_{i-1})
+
+        # three consecutive, distinct intensities (newest last)
+        I_im2, I_im1, I_i = I[-3], I[-2], I[-1]
+
+        # projections of the unknown residual G_{i-1} onto the two prior directions,
+        # divided through by |k'|^2 so the 2x2 below is solved in modal units.
+        g2k = gain ** 2 * kappa2
+        P_newest = (I_im1 - I_i   + g2k * np.abs(Ghat_im1) ** 2) / (2.0 * gain)
+        P_slid   = (I_im2 - I_im1 - g2k * np.abs(Ghat_im2) ** 2) / (2.0 * gain)
+        b0 = np.stack([P_slid, P_newest], axis=-1) / kappa2[:, None]   # (Npix, 2)
+
+        # M rows are the two prior estimate directions (modal units)
+        M = np.empty((npix, 2, 2))
+        M[:, 0, 0] = Ghat_im2.real
+        M[:, 0, 1] = Ghat_im2.imag
+        M[:, 1, 0] = Ghat_im1.real
+        M[:, 1, 1] = Ghat_im1.imag
+
+        # normal equations with a collinearity ridge: when the two prior directions
+        # align (residual collapsing along its own line) the ill-determined axis is
+        # pulled toward zero -- the correct limit -- while the parallel axis solves cleanly.
+        Mt = np.transpose(M, (0, 2, 1))
+        N = Mt @ M                                           # (Npix, 2, 2)
+        rhs = (Mt @ b0[..., None])[..., 0]                   # (Npix, 2)
+
+        lam = np.std(N[:, 0, 0])
+        # ridge = 1e-9 * (N[:, 0, 0] + N[:, 1, 1]) + 1e-10
+        ridge = 2 * lam + 1e-10
+        N[:, 0, 0] += ridge
+        N[:, 1, 1] += ridge
+        G_prev = np.linalg.solve(N, rhs[..., None])[..., 0]  # (Npix, 2) = residual G_{i-1}
+        G_prev = G_prev[:, 0] + 1j * G_prev[:, 1]
+
+        # propagate the one applied correction to the current frame
+        Ghat_i = G_prev - gain * Ghat_im1
+
+        # store in SAN convention (2 * Ghat) for the next furious step; null the current
+        # residual with dw = -gain * Ghat_i (matches SAN's -0.5 * gain * field_est).
+        self.prior_field_est.append(2.0 * Ghat_i)
+        return -gain * Ghat_i
+
+    def _solve_residual_differential(self, gain=None):
+        """Per-pixel weighted 2x2 least squares for the residual speckle field over the
+        forgetting-weighted history, returned as a ready-to-apply command increment
+        (consistent with :meth:`_solve_san_coefficients` and
+        :meth:`_solve_psi_coefficients`).
+
+        For each recorded frame k (command ``w_k``, image ``I_k``), with
+        ``delta_k = w_now - w_k`` and residual ``Z = R_now k'^*``::
 
             Re(Z delta_k^*) = (|k'|^2 |delta_k|^2 - (I_k - I0)) / 2 =: g_k.
 
-        Clustered frames (``delta_k -> 0``) contribute ~0 and self-cancel.  Returns
-        complex ``Z`` per pixel."""
+        Clustered frames (``delta_k -> 0``) contribute ~0 and self-cancel.  The 2x2 solve
+        gives ``Z = R_now k'^*``; the nulling command is ``dw = -gain * Z / |k'|^2`` (no
+        spurious 0.5 -- the solve returns ``Z`` directly, so damping belongs in ``gain``).
+
+        Parameters
+        ----------
+        gain : float or NoneType
+            gain to apply to the correction, defaults to 1 via self._resolve_gain(gain)
+
+        Returns
+        -------
+        complex ndarray
+           array of coefficients corresponding to each fourier mode,
+           where the real part is the cosine and the imag part is the sine
+        """
+        gain = self._resolve_gain(gain)
         I0 = self.last_image[self.dz]
         W = np.asarray(self.prior_corrections)              # (Nframes, Npix) complex
         I = np.asarray(self.prior_images)                   # (Nframes, Npix)
         nframes, npix = W.shape
         wt = (self.forget ** np.arange(nframes)[::-1])[:, None]
 
-        delta = self.w[None, :] - W                         # command change to now
-        p = delta.real
-        q = delta.imag
+        delta = self.coefficients[None, :] - W                         # command change to now
+        c = delta.real
+        s = delta.imag
         g = 0.5 * (self.kappa2[None, :] * np.abs(delta) ** 2 - (I - I0[None, :]))
 
         M = np.empty((npix, 2, 2))
-        M[:, 0, 0] = (wt * p * p).sum(0)
-        M[:, 0, 1] = M[:, 1, 0] = (wt * p * q).sum(0)
-        M[:, 1, 1] = (wt * q * q).sum(0)
-        b = np.stack([(wt * p * g).sum(0), (wt * q * g).sum(0)], axis=-1)
+        M[:, 0, 0] = (wt * c ** 2).sum(0)
+        M[:, 0, 1] = M[:, 1, 0] = (wt * c * s).sum(0)
+        M[:, 1, 1] = (wt * s ** 2).sum(0)
+        b = np.stack([(wt * c * g).sum(0), (wt * s * g).sum(0)], axis=-1)
 
         # tiny Tikhonov ridge so pixels that have only seen one quadrature don't blow up
         ridge = 1e-6 * (M[:, 0, 0] + M[:, 1, 1]) + 1e-30
@@ -234,7 +463,7 @@ class SpeckleNuller:
         M[:, 1, 1] += ridge
 
         Z = np.linalg.solve(M, b)                           # (Npix, 2): Re Z, Im Z
-        return Z[:, 0] + 1j * Z[:, 1]
+        return -gain * (Z[:, 0] + 1j * Z[:, 1]) / self.kappa2
 
     # -- subclass interface ---------------------------------------------------
     def step(self, gain=None):
@@ -256,38 +485,6 @@ class SpeckleAreaNulling(SpeckleNuller):
 
     def step(self, gain=None):
         self.san_step(gain)
-        self._iter += 1
-
-
-class SANAndFurious(SpeckleNuller):
-    """SAN and Furious (SAF): SAN seeding + per-pixel least-squares history reuse.
-
-    Classical phase-shifting interferometry needs >=3 temporal frames of the *whole*
-    interferogram because it can only piston the reference phase.  A coronagraph DM
-    imposes a phase shift that varies across the focal plane, so every dark-zone pixel
-    runs its own 3-bucket interferometer.  No probe data is thrown away: each applied
-    command is recorded with the image it produced, and once a pixel has seen >=3
-    phase-diverse commands its static speckle field is estimated by least squares
-    (:meth:`furious_step`).
-
-    Occasionally this will stall, which means that prior history is overwritten
-    and the nuller must be re-seeded with a SAN step
-
-    Parameters
-    ----------
-    forget : float in (0, 1]
-        Forgetting factor (see :class:`SpeckleNuller`).  Defaults to ``0.5``.
-    """
-
-    def __init__(self, model, gain=1.0, forget=0.5):
-        super().__init__(model, gain=gain, forget=forget)
-
-    def step(self, gain=None):
-        gain = self._resolve_gain(gain)
-        if self.kappa2 is None:
-            self.san_step(gain)
-        else:
-            self.furious_step(gain)
         self._iter += 1
 
 
@@ -318,31 +515,62 @@ class MinStepNulling(SpeckleNuller):
         super().__init__(model, gain=gain, forget=forget)
         self.eps = eps
 
-    def step(self, gain=None):
+    def _solve_minstep_coefficients(self, gain=None):
+        
         gain = self._resolve_gain(gain)
-        if self.kappa2 is None:
-            self.san_step(gain)             # one symmetric burst to calibrate |k'|^2
-            self._iter += 1
-            return
-
-        a = self.actuators
-        dz = self.dz
-        eps = self.eps
         cos_probe = self.model.cos_probe
         sin_probe = self.model.sin_probe
+        
+        # Grabs current command state
+        w0 = self.coefficients
+        a = self.actuators
 
-        I0 = self.last_image[dz]                             # reference (free, reused)
-        Ire = self._image(a + eps * cos_probe)[dz]
-        Iim = self._image(a + eps * sin_probe)[dz]
+        # Returns phase-shifted coefficients with images 
+        I0 = self.last_image[self.dz]                                 # reuse current-state image (free)
+        Ire = self._image(a + self.eps * cos_probe)[self.dz]
+        Iim = self._image(a + self.eps * sin_probe)[self.dz]
+        
+        self_term = self.kappa2 * self.eps ** 2                   # one-sided probe self-intensity
+        re = (Ire - I0 - self_term) / (2 * self.eps)              # Re(R k'^*)
+        im = (Iim - I0 - self_term) / (2 * self.eps)              # Im(R k'^*)
+        self._add_command(-gain * (re + 1j * im) / self.kappa2)    # dw = -(R k'^*)/|k'|^2
+        return -gain * (re + 1j * im) / self.kappa2
 
-        self_term = self.kappa2 * eps ** 2                   # one-sided probe self-intensity
-        re = (Ire - I0 - self_term) / (2 * eps)              # Re(R k'^*)
-        im = (Iim - I0 - self_term) / (2 * eps)              # Im(R k'^*)
-        self._apply(-gain * (re + 1j * im) / self.kappa2)    # dw = -(R k'^*)/|k'|^2
+    def recalibrate(self, gain=None):
+        self.san_step(gain)
         self._iter += 1
 
+    def min_step(self, gain=None):
 
-class FastAndFurious(SpeckleNuller):
+        # Requires SAN step to calibrate |k'|^2        
+        if self.kappa2 is None:
+            self.recalibrate(gain=gain)
+            return
+        
+        # Store reference values
+        a = self.actuators
+        w0 = self.coefficients
+        
+        # Get correction complex coefficients
+        # correction = self._solve_psi_coefficients(gain)
+        correction = self._solve_minstep_coefficients(gain)
+        
+        # Convert to DM commands
+        command = self._coefficients_to_command(correction)
+        
+        # Get an updated image
+        I_cor = self._image(a + command)
+
+        # Append correction to history with "probed" intensity
+        # Because we add to w0, this stores the total phase shift
+        # applied to the original correction
+        self._record(w0 + correction, I_cor)
+
+        # Actually apply the correction
+        self._add_command(correction)
+
+
+class LagStepNulling(SpeckleNuller):
     """Fast & Furious-style step: ONE fresh probe per iteration.
 
     The missing quadrature is supplied by the forgetting-weighted history of prior
@@ -361,56 +589,89 @@ class FastAndFurious(SpeckleNuller):
     def __init__(self, model, gain=1.0, forget=0.5, eps=0.5):
         super().__init__(model, gain=gain, forget=forget)
         self.eps = eps
-
-    def step(self, gain=None):
+    
+    def _solve_lagstep_coefficients(self, gain=None):
+        
         gain = self._resolve_gain(gain)
-        if self.kappa2 is None:
-            self.san_step(gain)             # one symmetric burst to calibrate |k'|^2
-            self._iter += 1
-            return
-
+        cos_probe = self.model.cos_probe
+        sin_probe = self.model.sin_probe
+        
+        # Grabs current command state
+        w0 = self.coefficients
         a = self.actuators
-        eps = self.eps
+
+        # Returns phase-shifted coefficients with images 
+        I0 = self.last_image[self.dz]                                 # reuse current-state image (free)
+        Ire = self._image(a + self.eps * cos_probe)[self.dz]
+        Iim = self._image(a + self.eps * sin_probe)[self.dz]
+        
+        self_term = self.kappa2 * self.eps ** 2                   # one-sided probe self-intensity
+        re = (Ire - I0 - self_term) / (2 * self.eps)              # Re(R k'^*)
+        im = (Iim - I0 - self_term) / (2 * self.eps)              # Im(R k'^*)
+        self._add_command(-gain * (re + 1j * im) / self.kappa2)    # dw = -(R k'^*)/|k'|^2
+        return -gain * (re + 1j * im) / self.kappa2
+
+    def recalibrate(self, gain=None):
+        self.san_step(gain)
+        self._iter += 1
+
+    def lag_step(self, gain=None):
+
+        # Requires SAN step to calibrate |k'|^2        
+        if self.kappa2 is None:
+            self.recalibrate(gain=gain)
+            return
+        
+        # Store reference values
+        a = self.actuators
+        w0 = self.coefficients
+        
+        # Alternate cosine / sine probes
         if self._iter % 2 == 0:
             probe, dw_fresh = self.model.cos_probe, eps + 0j      # +eps   (real quadrature)
         else:
             probe, dw_fresh = self.model.sin_probe, 1j * eps      # +i*eps (imag quadrature)
+        
+        # Take and record new fresh image
         I_fresh_full = self._image(a + eps * probe)
-        self._record(self.w, self.last_image)               # reference frame (a prior correction)
-        self._record(self.w + dw_fresh, I_fresh_full)       # fresh-probe frame
+        self._record(self.coefficients, self.last_image)               # reference frame (a prior correction)
+        self._record(self.coefficients + dw_fresh, I_fresh_full)       # fresh-probe frame
+        
+        # Get correction complex coefficients
+        correction = self._solve_residual_differential(gain)
+        
+        # Convert to DM commands
+        command = self._coefficients_to_command(correction)
+        
+        # Get an updated image
+        I_cor = self._image(a + command)
 
-        Zc = self._solve_residual_differential()
-        self._apply(-gain * Zc / self.kappa2)
-        self._iter += 1
+        # Append correction to history with "probed" intensity
+        # Because we add to w0, this stores the total phase shift
+        # applied to the original correction
+        self._record(w0 + correction, I_cor)
 
+        # Actually apply the correction
+        self._add_command(correction)
 
-class FastAndFuriousNoProbe(SpeckleNuller):
-    """Correction-history-only step ("Fast aNd Furious"): NO fresh probe.
+    # def step(self, gain=None):
+    #     gain = self._resolve_gain(gain)
+    #     if self.kappa2 is None:
+    #         self.san_step(gain)             # one symmetric burst to calibrate |k'|^2
+    #         self._iter += 1
+    #         return
 
-    After a single 5-frame SAN seed (which calibrates ``|k'|^2`` and injects both
-    quadratures), every update reuses ONLY the history of correction images: the prior
-    corrections themselves play the role of :class:`FastAndFurious`'s fresh quadrature
-    probe, since each contributes ``delta_k = w_now - w_k`` to the same differential
-    least squares.  Cost: 1 exposure/iteration (just the post-correction image).
+    #     a = self.actuators
+    #     eps = self.eps
+        
+    #     if self._iter % 2 == 0:
+    #         probe, dw_fresh = self.model.cos_probe, eps + 0j      # +eps   (real quadrature)
+    #     else:
+    #         probe, dw_fresh = self.model.sin_probe, 1j * eps      # +i*eps (imag quadrature)
+    #     I_fresh_full = self._image(a + eps * probe)
+    #     self._record(self.coefficients, self.last_image)               # reference frame (a prior correction)
+    #     self._record(self.coefficients + dw_fresh, I_fresh_full)       # fresh-probe frame
 
-    Because the seed's +/- cos/sin frames sit at fixed, well-spread commands, their
-    ``delta_k`` to the drifting current state stay large and span both quadratures,
-    keeping the per-pixel 2x2 solve conditioned.  With ``forget=1`` they are never
-    discarded; a strong forgetting factor would throw away the only diversity, so the
-    default here is ``forget=1.0``.
-    """
-
-    def __init__(self, model, gain=1.0, forget=1.0):
-        super().__init__(model, gain=gain, forget=forget)
-
-    def step(self, gain=None):
-        gain = self._resolve_gain(gain)
-        if self.kappa2 is None:
-            self.san_step(gain)             # 5-frame seed: calibrate |k'|^2 + both quadratures
-            self._iter += 1
-            return
-
-        self._record(self.w, self.last_image)               # current corrected state (no probe)
-        Zc = self._solve_residual_differential()
-        self._apply(-gain * Zc / self.kappa2)
-        self._iter += 1
+    #     Zc = self._solve_residual_differential()
+    #     self._add_command(Zc)
+    #     self._iter += 1

@@ -2,10 +2,10 @@
 
 Quick start::
 
-    from san import CoronagraphModel, SANAndFurious
+    from san import CoronagraphModel, FastAndFuriousNoProbe
 
     model = CoronagraphModel()
-    nuller = SANAndFurious(model)
+    nuller = FastAndFuriousNoProbe(model)
     for _ in range(10):
         nuller.step()
         print(nuller.contrast)
@@ -15,18 +15,14 @@ from .models import CoronagraphModel
 from .algorithms import (
     SpeckleNuller,
     SpeckleAreaNulling,
-    SANAndFurious,
     MinStepNulling,
-    FastAndFurious,
-    FastAndFuriousNoProbe,
+    LagStepNulling,
 )
 
 __all__ = [
     "CoronagraphModel",
     "SpeckleNuller",
     "SpeckleAreaNulling",
-    "SANAndFurious",
     "MinStepNulling",
-    "FastAndFurious",
-    "FastAndFuriousNoProbe",
+    "LagStepNulling",
 ]
