@@ -18,10 +18,7 @@ import matplotlib.pyplot as plt
 from san import (
     CoronagraphModel,
     SpeckleAreaNulling,
-    SANAndFurious,
     MinStepNulling,
-    FastAndFurious,
-    FastAndFuriousNoProbe,
 )
 
 # ---------------------------------------------------------------------------

@@ -5,11 +5,7 @@ import matplotlib.pyplot as plt
 
 from san import (
     CoronagraphModel,
-    SpeckleAreaNulling,
-    SANAndFurious,
     MinStepNulling,
-    FastAndFurious,
-    FastAndFuriousNoProbe,
 )
 
 # ---------------------------------------------------------------------------
@@ -32,8 +28,6 @@ gain = 1.0
 # Test original 5-step algorithm from Oya+ 2017
 # nuller = SpeckleAreaNulling(model, gain=gain) 
 nuller = MinStepNulling(model, gain=gain) 
-# nuller = SANAndFurious(model, gain=gain) 
-# nuller = FastAndFuriousNoProbe(model, gain=gain)
 img_initial = model.image()
 
 

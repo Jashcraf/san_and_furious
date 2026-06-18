@@ -224,10 +224,10 @@ class SpeckleNuller:
 
         # Records applied phase shifts
         # self._record(w0, I0) 
-        # self._record(w0 + 1,   Icp)
-        # self._record(w0 - 1,   Icm)
-        # self._record(w0 + 1j,  Isp)
-        # self._record(w0 - 1j,  Ism)
+        self._record(w0 + 1,   Icp)
+        self._record(w0 - 1,   Icm)
+        self._record(w0 + 1j,  Isp)
+        self._record(w0 - 1j,  Ism)
 
         # Gets dark zone boolean
         dz = self.dz
@@ -407,7 +407,9 @@ class SpeckleNuller:
         N = Mt @ M                                           # (Npix, 2, 2)
         rhs = (Mt @ b0[..., None])[..., 0]                   # (Npix, 2)
 
-        lam = np.std(N[:, 0, 0])
+        # Copilot suggested - could be nice doing a per-pix regularization
+        lam = np.linalg.eigvalsh(N).max(axis=-1)                 # per-pixel spectral radius
+
         ridge = 1e-2 * lam + 1e-10
         N[:, 0, 0] += ridge
         N[:, 1, 1] += ridge
