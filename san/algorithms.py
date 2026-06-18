@@ -361,55 +361,123 @@ class SpeckleNuller:
         gain = self._resolve_gain(gain)
 
         I = np.asarray(self.prior_images)                    # (Nframes, Npix) real
-        F = np.asarray(self.prior_field_est)                 # (Nframes, Npix) complex (= 2 * Ghat)
         nframes, npix = I.shape
-        # assert nframes >= 3 and F.shape[0] >= 2, \
-        #     "furious_step needs >= 3 recorded frames; seed with >= 3 san_step calls"
-
         kappa2 = self.kappa2                                  # (Npix,) = |k'|^2
 
-        # field estimates whose -g*Ghat corrections produced the two most recent frames
-        # (modal-residual units); F stores the SAN convention 2 * Ghat.
-        Ghat_im1 = 0.5 * F[-1]                               # Ghat_{i-1}  (made I_i)
-        Ghat_im2 = 0.5 * F[-2]                               # Ghat_{i-2}  (made I_{i-1})
+        # Before three distinct frames exist, the 2x2 solve has too little temporal
+        # diversity; fall back to the single-correction bootstrap (iterative_san.bootstrap)
+        # to seed it.  The next furious step has 3 frames and takes the 2x2 path.
+        if nframes < 2:
+            raise ValueError(
+                "furious_step needs >= 2 recorded frames to bootstrap; "
+                "seed with >= 2 san_step calls")
+        if nframes < 3:
+            return self._bootstrap_furious(I, kappa2, gain)
 
-        # three consecutive, distinct intensities (newest last)
-        I_im2, I_im1, I_i = I[-3], I[-2], I[-1]
+        # Actual applied modal strokes, recovered by differencing the recorded total
+        # commands.  This is the real DM move between frames and is gain-agnostic, so
+        # the solve does NOT assume the seeding gain equals the current furious gain --
+        # the (previously implicit) assumption that broke convergence when the SAN seed
+        # ran at a different gain than the furious loop.
+        W = np.asarray(self.prior_corrections)              # (Nframes, Npix) complex
+        s_slid = W[-2] - W[-3]                               # stroke i-2 -> i-1 (made I[-2])
+        s_new  = W[-1] - W[-2]                               # stroke i-1 -> i   (made I[-1])
 
-        # projections of the unknown residual G_{i-1} onto the two prior directions,
-        # divided through by |k'|^2 so the 2x2 below is solved in modal units.
-        g2k = gain ** 2 * kappa2
-        P_newest = (I_im1 - I_i   + g2k * np.abs(Ghat_im1) ** 2) / (2.0 * gain)
-        P_slid   = (I_im2 - I_im1 - g2k * np.abs(Ghat_im2) ** 2) / (2.0 * gain)
-        b0 = np.stack([P_slid, P_newest], axis=-1) / kappa2[:, None]   # (Npix, 2)
+        # three consecutive, distinct intensities in modal units |G|^2 = I / |k'|^2
+        i_im2, i_im1, i_i = I[-3] / kappa2, I[-2] / kappa2, I[-1] / kappa2
 
-        # M rows are the two prior estimate directions (modal units)
+        # projections of the unknown residual G_{i-1} (at frame i-1) onto each stroke:
+        #   |G_{i-1} - s_slid|^2 = i_im2  ->  Re(s_slid^* G) = (i_im1 - i_im2 + |s_slid|^2)/2
+        #   |G_{i-1} + s_new |^2 = i_i    ->  Re(s_new^*  G) = (i_i  - i_im1 - |s_new|^2)/2
+        P_slid = (i_im1 - i_im2 + np.abs(s_slid) ** 2) / 2.0
+        P_new  = (i_i   - i_im1 - np.abs(s_new) ** 2) / 2.0
+        b0 = np.stack([P_slid, P_new], axis=-1)             # (Npix, 2)
+
+        # M rows are the two applied stroke directions (modal units)
         M = np.empty((npix, 2, 2))
-        M[:, 0, 0] = Ghat_im2.real
-        M[:, 0, 1] = Ghat_im2.imag
-        M[:, 1, 0] = Ghat_im1.real
-        M[:, 1, 1] = Ghat_im1.imag
+        M[:, 0, 0] = s_slid.real
+        M[:, 0, 1] = s_slid.imag
+        M[:, 1, 0] = s_new.real
+        M[:, 1, 1] = s_new.imag
 
-        # normal equations with a collinearity ridge: when the two prior directions
-        # align (residual collapsing along its own line) the ill-determined axis is
-        # pulled toward zero -- the correct limit -- while the parallel axis solves cleanly.
+        # normal equations with a collinearity ridge: when the two strokes align
+        # (residual collapsing along its own line) the ill-determined axis is pulled
+        # toward zero -- the correct limit -- while the parallel axis solves cleanly.
         Mt = np.transpose(M, (0, 2, 1))
         N = Mt @ M                                           # (Npix, 2, 2)
         rhs = (Mt @ b0[..., None])[..., 0]                   # (Npix, 2)
 
         lam = np.std(N[:, 0, 0])
-        # ridge = 1e-9 * (N[:, 0, 0] + N[:, 1, 1]) + 1e-10
-        ridge = 2 * lam + 1e-10
+        ridge = 1e-2 * lam + 1e-10
         N[:, 0, 0] += ridge
         N[:, 1, 1] += ridge
         G_prev = np.linalg.solve(N, rhs[..., None])[..., 0]  # (Npix, 2) = residual G_{i-1}
         G_prev = G_prev[:, 0] + 1j * G_prev[:, 1]
 
-        # propagate the one applied correction to the current frame
-        Ghat_i = G_prev - gain * Ghat_im1
+        # propagate the most recent applied stroke to the current frame i
+        Ghat_i = G_prev + s_new
 
         # store in SAN convention (2 * Ghat) for the next furious step; null the current
         # residual with dw = -gain * Ghat_i (matches SAN's -0.5 * gain * field_est).
+        self.prior_field_est.append(2.0 * Ghat_i)
+        return -gain * Ghat_i
+
+    def _bootstrap_furious(self, I, kappa2, gain, s0=+1):
+        """Single-correction bootstrap that seeds the furious 2x2 solve.
+
+        Port of ``bootstrap`` in ``iterative_san.py``, vectorized over pixels and
+        worked in modal-residual units ``G = R / k'`` (so ``|G|^2 = I / |k'|^2``).
+        With only one applied correction recorded there is no second stroke direction
+        for the 2x2 solve, so the residual is reconstructed from the two intensity
+        circles plus a *guessed* perpendicular sign ``s0``.  That guess is harmless:
+        the next step has three frames and the unambiguous 2x2 solve overwrites it.
+
+        The single applied stroke ``s`` (recovered from the recorded commands, hence
+        gain-agnostic) took the field from frame ``I[-2]`` (before) to ``I[-1]``
+        (after), with ``G_after = G_before + s``::
+
+            |G_before + s|^2 = i_after  ->  Re(s^* G_before) = (i_after - i_before - |s|^2)/2
+            |G_before|^2     = i_before                       (the pre-correction circle)
+
+        decomposing ``G_before`` along ``s`` (well-determined) and its perpendicular
+        (sign-guessed), then propagating the stroke to the current frame::
+
+            Ghat_i = G_before + s,   nulled by  dw = -gain * Ghat_i.
+
+        Parameters
+        ----------
+        I : ndarray, shape (Nframes, Npix)
+            Recorded dark-zone intensities (newest last); only the last two are used.
+        kappa2 : ndarray, shape (Npix,)
+            Per-pixel gain ``|k'|^2``.
+        gain : float
+            Loop gain applied when nulling the reconstructed current residual.
+        s0 : int
+            Guessed sign of the perpendicular component (overwritten next step).
+
+        Returns
+        -------
+        complex ndarray
+            modal command increment (a_probe units) per Fourier mode.
+        """
+        W = np.asarray(self.prior_corrections)               # (Nframes, Npix) complex
+        s = W[-1] - W[-2]                                     # the single applied stroke (made I[-1])
+        i_before = I[-2] / kappa2                             # modal |G_before|^2
+        i_after  = I[-1] / kappa2
+
+        proj = (i_after - i_before - np.abs(s) ** 2) / 2.0   # = Re(s^* G_before)
+        mag = np.abs(s)
+        safe = np.where(mag > 0, mag, 1.0)                   # avoid 0/0 at un-probed pixels
+        unit = s / safe
+        perp = 1j * unit                                     # 90-deg rotation
+        G_par = proj / safe                                  # component of G_before along s
+        G_perp = np.sqrt(np.maximum(0.0, i_before - G_par ** 2))
+        G_before = G_par * unit + s0 * G_perp * perp
+
+        # propagate the applied stroke to the current frame
+        Ghat_i = G_before + s
+
+        # store in SAN convention (2 * Ghat) so the next (2x2) step can read it back
         self.prior_field_est.append(2.0 * Ghat_i)
         return -gain * Ghat_i
 
@@ -456,13 +524,14 @@ class SpeckleNuller:
         M[:, 0, 1] = M[:, 1, 0] = (wt * c * s).sum(0)
         M[:, 1, 1] = (wt * s ** 2).sum(0)
         b = np.stack([(wt * c * g).sum(0), (wt * s * g).sum(0)], axis=-1)
+        b = b[..., None]
 
         # tiny Tikhonov ridge so pixels that have only seen one quadrature don't blow up
         ridge = 1e-6 * (M[:, 0, 0] + M[:, 1, 1]) + 1e-30
         M[:, 0, 0] += ridge
         M[:, 1, 1] += ridge
-
-        Z = np.linalg.solve(M, b)                           # (Npix, 2): Re Z, Im Z
+        Z = np.linalg.solve(M, b)
+        Z = Z[..., 0]
         return -gain * (Z[:, 0] + 1j * Z[:, 1]) / self.kappa2
 
     # -- subclass interface ---------------------------------------------------
@@ -628,12 +697,12 @@ class LagStepNulling(SpeckleNuller):
         
         # Alternate cosine / sine probes
         if self._iter % 2 == 0:
-            probe, dw_fresh = self.model.cos_probe, eps + 0j      # +eps   (real quadrature)
+            probe, dw_fresh = self.model.cos_probe, self.eps + 0j      # +eps   (real quadrature)
         else:
-            probe, dw_fresh = self.model.sin_probe, 1j * eps      # +i*eps (imag quadrature)
+            probe, dw_fresh = self.model.sin_probe, 1j * self.eps      # +i*eps (imag quadrature)
         
         # Take and record new fresh image
-        I_fresh_full = self._image(a + eps * probe)
+        I_fresh_full = self._image(a + self.eps * probe)
         self._record(self.coefficients, self.last_image)               # reference frame (a prior correction)
         self._record(self.coefficients + dw_fresh, I_fresh_full)       # fresh-probe frame
         
@@ -653,6 +722,11 @@ class LagStepNulling(SpeckleNuller):
 
         # Actually apply the correction
         self._add_command(correction)
+
+        # Advance the step counter so the fresh probe alternates cos/sin quadratures
+        # next iteration; without this only one quadrature is ever freshly probed and
+        # the other axis goes singular as the corrections shrink (the loop plateaus).
+        self._iter += 1
 
     # def step(self, gain=None):
     #     gain = self._resolve_gain(gain)
